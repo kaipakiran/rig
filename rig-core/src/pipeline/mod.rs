@@ -96,11 +96,15 @@ pub mod parallel;
 pub mod conditional;
 
 use std::future::Future;
+use futures::{Stream, StreamExt};
+use std::marker::PhantomData;
+use std::pin::Pin;
 
-pub use op::{map, passthrough, then, Op};
+pub use op::{map, passthrough, then, Op, StreamingOp, StreamingMap, StreamingThen, StreamingPassthrough};
 pub use try_op::TryOp;
+pub use agent_ops::StreamingPrompt;
 
-use crate::{completion, extractor::Extractor, vector_store};
+use crate::{completion, extractor::Extractor, vector_store, streaming::{StreamingPrompt as StreamingPromptTrait, StreamingCompletionResponse, StreamingCompletionModel}, message::{Message, AssistantContent}, completion::CompletionError};
 
 pub struct PipelineBuilder<E> {
     _error: std::marker::PhantomData<E>,
@@ -277,6 +281,48 @@ impl<E> PipelineBuilder<E> {
     {
         agent_ops::Extract::new(extractor)
     }
+
+    /// Add a streaming prompt to the pipeline
+    ///
+    /// # Example
+    /// ```rust
+    /// use rig::{
+    ///     pipeline::{self, StreamingOp},
+    ///     providers::gemini::{self, completion::GEMINI_1_5_FLASH},
+    ///     message::AssistantContent,
+    /// };
+    /// use futures::StreamExt;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = gemini::Client::from_env();
+    /// let model = client.completion_model(GEMINI_1_5_FLASH);
+    /// let streaming_model = pipeline::model_streaming(model);
+    ///
+    /// // Use pipeline::new() with streaming_prompt to create a streaming pipeline
+    /// let pipeline = pipeline::new()
+    ///     .streaming_prompt(streaming_model)
+    ///     .map(|content| {
+    ///         if let AssistantContent::Text(text) = content {
+    ///             text.text
+    ///         } else {
+    ///             "".to_string()
+    ///         }
+    ///     });
+    ///
+    /// let mut stream = pipeline.stream("What is Rust?").await;
+    /// while let Some(text) = stream.next().await {
+    ///     print!("{}", text);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn streaming_prompt<P, R>(self, prompt: P) -> StreamingPipelineStage<P, R>
+    where
+        P: StreamingPromptTrait<R> + Send + Sync + Clone,
+        R: Clone + Unpin,
+    {
+        StreamingPipelineStage::new(prompt)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -297,6 +343,267 @@ pub fn new() -> PipelineBuilder<ChainError> {
 pub fn with_error<E>() -> PipelineBuilder<E> {
     PipelineBuilder {
         _error: std::marker::PhantomData,
+    }
+}
+
+/// Creates a new streaming pipeline that passes through its input without modification.
+/// Use with `.map()`, `.then()`, or `.chain()` to build streaming pipelines.
+pub fn streaming<T>() -> impl StreamingOp<Input = T, Output = T>
+where
+    T: Send + Sync + Clone + 'static,
+{
+    StreamingPassthrough::new()
+}
+
+/// Create a new streaming pipeline that maps its input using the given function
+pub fn streaming_map<F, Input, Output>(f: F) -> impl StreamingOp<Input = Input, Output = Output>
+where
+    F: Fn(Input) -> Output + Send + Sync + Clone + 'static,
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+{
+    StreamingMap::new(f)
+}
+
+/// Create a new streaming pipeline that maps its input using the given async function
+pub fn streaming_then<F, Input, Fut>(f: F) -> impl StreamingOp<Input = Input, Output = Fut::Output>
+where
+    F: Fn(Input) -> Fut + Send + Sync + Clone + 'static,
+    Input: Send + Sync + 'static,
+    Fut: Future + Send + Sync + 'static,
+    Fut::Output: Send + Sync + 'static,
+{
+    StreamingThen::new(f)
+}
+
+/// Create a new streaming prompt
+pub fn streaming_prompt<P, Input>(prompt: P) -> agent_ops::StreamingPrompt<P, Input>
+where
+    P: crate::streaming::StreamingPrompt<P::StreamingResponse> + crate::streaming::StreamingCompletionModel + Clone + Send + Sync + 'static,
+    P::StreamingResponse: Clone + Unpin + Send + Sync + 'static,
+    Input: Into<String> + Send + Sync + 'static,
+{
+    agent_ops::StreamingPrompt::new(prompt)
+}
+
+/// A stage in a streaming pipeline that can transform streaming responses
+pub struct StreamingPipelineStage<P, R> {
+    prompt: P,
+    _r: PhantomData<R>,
+}
+
+impl<P, R> StreamingPipelineStage<P, R>
+where
+    P: StreamingPromptTrait<R> + Send + Sync + Clone,
+    R: Clone + Unpin,
+{
+    pub fn new(prompt: P) -> Self {
+        Self {
+            prompt,
+            _r: PhantomData,
+        }
+    }
+
+    /// Stream a prompt and return the streaming response
+    pub async fn stream(
+        &self, 
+        input: impl Into<Message> + Send
+    ) -> Result<StreamingCompletionResponse<R>, CompletionError> {
+        self.prompt.stream_prompt(input).await
+    }
+
+    /// Apply a transformation to each item in the stream
+    pub fn map<F, O>(self, f: F) -> StreamingMapStage<Self, F, R, O>
+    where
+        F: Fn(AssistantContent) -> O + Send + Sync + Clone + 'static,
+        O: Send + 'static,
+    {
+        StreamingMapStage {
+            source: self,
+            mapper: f,
+            _r: PhantomData,
+            _o: PhantomData,
+        }
+    }
+}
+
+pub struct StreamingMapStage<S, F, R, O> {
+    source: S,
+    mapper: F,
+    _r: PhantomData<R>,
+    _o: PhantomData<O>,
+}
+
+impl<S, F, R, O> StreamingMapStage<S, F, R, O> {
+    pub fn new(source: S, mapper: F) -> Self {
+        Self {
+            source,
+            mapper,
+            _r: PhantomData,
+            _o: PhantomData,
+        }
+    }
+
+    pub fn map<F2, O2>(self, f2: F2) -> StreamingMapStage<Self, F2, R, O2>
+    where
+        F2: Fn(O) -> O2 + Send + Sync + Clone + 'static,
+        O2: Send + 'static,
+        Self: Clone,
+    {
+        StreamingMapStage {
+            source: self,
+            mapper: f2,
+            _r: PhantomData,
+            _o: PhantomData,
+        }
+    }
+}
+
+// Implementation for nested StreamingMapStage with a StreamingPipelineStage inside
+impl<P, F1, F2, R, O1, O2> StreamingMapStage<StreamingMapStage<StreamingPipelineStage<P, R>, F1, R, O1>, F2, R, O2>
+where
+    P: StreamingPromptTrait<R> + Send + Sync + Clone + 'static,
+    F1: Fn(AssistantContent) -> O1 + Send + Sync + Clone + 'static,
+    F2: Fn(O1) -> O2 + Send + Sync + Clone + 'static,
+    R: Clone + Unpin + Send + Sync + 'static,
+    O1: Send + 'static,
+    O2: Send + 'static,
+{
+    pub async fn stream(
+        &self, 
+        input: impl Into<Message> + Send
+    ) -> impl Stream<Item = O2> + Send {
+        let converted_input = input.into();
+        let source = self.source.clone();
+        let inner_stream = source.stream(converted_input).await;
+        let mapper = self.mapper.clone();
+        
+        Box::pin(inner_stream.map(move |item| (mapper)(item))) as Pin<Box<dyn Stream<Item = O2> + Send>>
+    }
+}
+
+// Implementation specifically for when the source is StreamingPipelineStage
+impl<P, F, R, O> StreamingMapStage<StreamingPipelineStage<P, R>, F, R, O>
+where
+    P: StreamingPromptTrait<R> + Send + Sync + Clone,
+    F: Fn(AssistantContent) -> O + Send + Sync + Clone + 'static,
+    R: Clone + Unpin + Send + Sync + 'static,
+    O: Send + 'static,
+{
+    pub async fn stream(
+        &self, 
+        input: impl Into<Message> + Send
+    ) -> impl Stream<Item = O> + Send {
+        let source = self.source.clone();
+        let result = source.stream(input).await;
+        let mapper = self.mapper.clone();
+        
+        match result {
+            Ok(response) => {
+                Box::pin(response.map(move |result| {
+                    match result {
+                        Ok(content) => (mapper)(content),
+                        Err(e) => panic!("Error in stream: {}", e), // Or handle more gracefully
+                    }
+                })) as Pin<Box<dyn Stream<Item = O> + Send>>
+            },
+            Err(e) => {
+                eprintln!("Error starting stream: {}", e);
+                Box::pin(futures::stream::empty()) as Pin<Box<dyn Stream<Item = O> + Send>>
+            }
+        }
+    }
+}
+
+impl<P, R> Clone for StreamingPipelineStage<P, R>
+where
+    P: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prompt: self.prompt.clone(),
+            _r: PhantomData,
+        }
+    }
+}
+
+/// Create a new streaming pipeline with a streaming prompt
+pub fn streaming_pipeline<P, R>(prompt: P) -> StreamingPipelineStage<P, R>
+where
+    P: StreamingPromptTrait<R> + Send + Sync + Clone,
+    R: Clone + Unpin,
+{
+    StreamingPipelineStage::new(prompt)
+}
+
+/// Create a streaming adapter for a model
+pub fn model_streaming<M>(model: M) -> StreamingModelAdapter<M>
+where
+    M: StreamingCompletionModel + Clone + Send + Sync + 'static,
+{
+    StreamingModelAdapter::new(model)
+}
+
+/// Adapter for using a StreamingCompletionModel directly with streaming pipelines
+pub struct StreamingModelAdapter<M> {
+    model: M,
+}
+
+impl<M> StreamingModelAdapter<M>
+where
+    M: StreamingCompletionModel + Clone + Send + Sync + 'static,
+{
+    pub fn new(model: M) -> Self {
+        Self { model }
+    }
+}
+
+impl<M> StreamingPromptTrait<M::StreamingResponse> for StreamingModelAdapter<M>
+where
+    M: StreamingCompletionModel + Clone + Send + Sync + 'static,
+    M::StreamingResponse: Clone + Unpin,
+{
+    async fn stream_prompt(
+        &self,
+        prompt: impl Into<Message> + Send,
+    ) -> Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError> {
+        let msg = prompt.into();
+        let request = completion::CompletionRequest { 
+            chat_history: crate::OneOrMany::one(msg),
+            preamble: None,
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+        };
+        self.model.stream(request).await
+    }
+}
+
+impl<M> Clone for StreamingModelAdapter<M>
+where
+    M: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+        }
+    }
+}
+
+impl<S, F, R, O> Clone for StreamingMapStage<S, F, R, O>
+where
+    S: Clone,
+    F: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            mapper: self.mapper.clone(),
+            _r: PhantomData,
+            _o: PhantomData,
+        }
     }
 }
 

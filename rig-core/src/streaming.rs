@@ -42,7 +42,7 @@ pub enum RawStreamingChoice<R: Clone> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type StreamingResult<R> =
-    Pin<Box<dyn Stream<Item = Result<RawStreamingChoice<R>, CompletionError>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<RawStreamingChoice<R>, CompletionError>> + Send + Sync>>;
 
 #[cfg(target_arch = "wasm32")]
 pub type StreamingResult<R> =
@@ -152,7 +152,7 @@ pub trait StreamingPrompt<R: Clone + Unpin>: Send + Sync {
     fn stream_prompt(
         &self,
         prompt: impl Into<Message> + Send,
-    ) -> impl Future<Output = Result<StreamingCompletionResponse<R>, CompletionError>>;
+    ) -> impl Future<Output = Result<StreamingCompletionResponse<R>, CompletionError>> + Send;
 }
 
 /// Trait for high-level streaming chat interface

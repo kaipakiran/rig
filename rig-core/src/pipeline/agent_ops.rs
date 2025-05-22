@@ -1,13 +1,19 @@
 use std::future::IntoFuture;
 
 use crate::{
-    completion::{self, CompletionModel},
+    completion::{self, CompletionModel, CompletionError, CompletionRequest, CompletionRequestBuilder},
     extractor::{ExtractionError, Extractor},
     message::Message,
     vector_store,
+    streaming::{StreamingCompletionModel, StreamingCompletionResponse, StreamingPrompt as StreamingPromptTrait},
 };
 
-use super::Op;
+use super::op::{Op, StreamingOp};
+use futures::{Stream, StreamExt, stream};
+use serde::de::DeserializeOwned;
+use std::future::Future;
+use std::pin::Pin;
+use futures::future::BoxFuture;
 
 pub struct Lookup<I, In, T> {
     index: I,
@@ -102,6 +108,61 @@ where
     In: Into<String> + Send + Sync,
 {
     Prompt::new(model)
+}
+
+pub struct StreamingPrompt<P, Input>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+{
+    prompt: P,
+    _t: std::marker::PhantomData<Input>,
+}
+
+impl<P, Input> StreamingPrompt<P, Input>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+{
+    pub fn new(prompt: P) -> Self {
+        Self {
+            prompt,
+            _t: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P, Input> StreamingOp for StreamingPrompt<P, Input>
+where
+    P: StreamingPromptTrait<P::StreamingResponse> + StreamingCompletionModel + Clone + Send + Sync + 'static,
+    P::StreamingResponse: Clone + Unpin + Send + Sync + 'static,
+    Input: Into<String> + Send + Sync + 'static,
+{
+    type Input = Input;
+    type Output = Result<StreamingCompletionResponse<P::StreamingResponse>, CompletionError>;
+    type Stream = Pin<Box<dyn Stream<Item = Self::Output> + Send>>;
+
+    fn stream(&self, input: Self::Input) -> BoxFuture<'static, Self::Stream> {
+        let prompt = self.prompt.clone();
+        let message = Message::user(input.into());
+        Box::pin(async move {
+            let result = prompt.stream_prompt(message).await;
+            Box::pin(stream::once(futures::future::ready(result))) as Pin<Box<dyn Stream<Item = Self::Output> + Send>>
+        })
+    }
+}
+
+impl<P, Input> Clone for StreamingPrompt<P, Input>
+where
+    P: Clone + Send + Sync,
+    Input: Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prompt: self.prompt.clone(),
+            _t: std::marker::PhantomData,
+        }
+    }
 }
 
 pub struct Extract<M, Input, Output>

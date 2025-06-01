@@ -100,9 +100,9 @@ use futures::{Stream, StreamExt};
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-pub use op::{map, passthrough, then, Op, StreamingOp, StreamingMap, StreamingThen, StreamingPassthrough};
+pub use op::{map, passthrough, then, Op};
 pub use try_op::TryOp;
-pub use agent_ops::{StreamingPrompt, StreamingSender};
+pub use agent_ops::StreamingSender;
 
 use crate::{completion, extractor::Extractor, vector_store, streaming::{StreamingPrompt as StreamingPromptTrait, StreamingCompletionResponse, StreamingCompletionModel}, message::{Message, AssistantContent}, completion::CompletionError};
 
@@ -389,43 +389,12 @@ pub fn with_error<E>() -> PipelineBuilder<E> {
 
 /// Creates a new streaming pipeline that passes through its input without modification.
 /// Use with `.map()`, `.then()`, or `.chain()` to build streaming pipelines.
-pub fn streaming<T>() -> impl StreamingOp<Input = T, Output = T>
-where
-    T: Send + Sync + Clone + 'static,
-{
-    StreamingPassthrough::new()
-}
 
 /// Create a new streaming pipeline that maps its input using the given function
-pub fn streaming_map<F, Input, Output>(f: F) -> impl StreamingOp<Input = Input, Output = Output>
-where
-    F: Fn(Input) -> Output + Send + Sync + Clone + 'static,
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-{
-    StreamingMap::new(f)
-}
 
 /// Create a new streaming pipeline that maps its input using the given async function
-pub fn streaming_then<F, Input, Fut>(f: F) -> impl StreamingOp<Input = Input, Output = Fut::Output>
-where
-    F: Fn(Input) -> Fut + Send + Sync + Clone + 'static,
-    Input: Send + Sync + 'static,
-    Fut: Future + Send + Sync + 'static,
-    Fut::Output: Send + Sync + 'static,
-{
-    StreamingThen::new(f)
-}
 
 /// Create a new streaming prompt
-pub fn streaming_prompt<P, Input>(prompt: P) -> agent_ops::StreamingPrompt<P, Input>
-where
-    P: crate::streaming::StreamingPrompt<P::StreamingResponse> + crate::streaming::StreamingCompletionModel + Clone + Send + Sync + 'static,
-    P::StreamingResponse: Clone + Unpin + Send + Sync + 'static,
-    Input: Into<String> + Send + Sync + 'static,
-{
-    agent_ops::StreamingPrompt::new(prompt)
-}
 
 /// Create a new streaming prompt operation that sends chunks via a generic sender and returns the final response
 pub fn streaming_prompt_with_sender<P, Input, S>(

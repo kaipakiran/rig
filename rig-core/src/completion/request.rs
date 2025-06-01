@@ -138,7 +138,7 @@ impl std::fmt::Display for Document {
                 sorted_props.sort_by(|a, b| a.0.cmp(b.0));
                 let metadata = sorted_props
                     .iter()
-                    .map(|(k, v)| format!("{}: {:?}", k, v))
+                    .map(|(k, v)| format!("{k}: {v:?}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 format!("<metadata {} />\n{}", metadata, self.text)
@@ -242,6 +242,7 @@ pub trait CompletionModel: Clone + Send + Sync {
 }
 
 /// Struct representing a general completion request that can be sent to a completion model provider.
+#[derive(Debug, Clone)]
 pub struct CompletionRequest {
     /// The preamble to be sent to the completion model provider
     pub preamble: Option<String>,

@@ -102,7 +102,7 @@ use std::pin::Pin;
 
 pub use op::{map, passthrough, then, Op, StreamingOp, StreamingMap, StreamingThen, StreamingPassthrough};
 pub use try_op::TryOp;
-pub use agent_ops::StreamingPrompt;
+pub use agent_ops::{StreamingPrompt, StreamingSender};
 
 use crate::{completion, extractor::Extractor, vector_store, streaming::{StreamingPrompt as StreamingPromptTrait, StreamingCompletionResponse, StreamingCompletionModel}, message::{Message, AssistantContent}, completion::CompletionError};
 
@@ -323,6 +323,47 @@ impl<E> PipelineBuilder<E> {
     {
         StreamingPipelineStage::new(prompt)
     }
+
+    /// Add a streaming prompt operation that sends chunks via a generic sender and returns the final response
+    /// 
+    /// This allows you to get real-time streaming updates while still working with the regular Op interface.
+    /// Works with tokio::sync::mpsc::UnboundedSender or any custom sender that implements StreamingSender.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rig::pipeline::{self, Op};
+    /// use tokio::sync::mpsc;
+    ///
+    /// let (tx, mut rx) = mpsc::unbounded_channel();
+    /// let agent = &openai_client.agent("gpt-4").build();
+    ///
+    /// let pipeline = pipeline::new()
+    ///    .map(|name| format!("Tell me about: {name}"))
+    ///    .streaming_prompt_with_sender(agent, tx);
+    ///
+    /// // Handle streaming chunks in a separate task
+    /// tokio::spawn(async move {
+    ///     while let Some(chunk) = rx.recv().await {
+    ///         print!("{}", chunk);
+    ///     }
+    /// });
+    ///
+    /// // This will return the final complete response
+    /// let result = pipeline.call("Rust programming".to_string()).await?;
+    /// ```
+    pub fn streaming_prompt_with_sender<P, Input, S>(
+        self, 
+        agent: P, 
+        sender: S
+    ) -> agent_ops::StreamingPromptWithSender<P, Input, S>
+    where
+        P: Send + Sync,
+        Input: Send + Sync,
+        S: agent_ops::StreamingSender,
+        Self: Sized,
+    {
+        agent_ops::StreamingPromptWithSender::new(agent, sender)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,6 +425,19 @@ where
     Input: Into<String> + Send + Sync + 'static,
 {
     agent_ops::StreamingPrompt::new(prompt)
+}
+
+/// Create a new streaming prompt operation that sends chunks via a generic sender and returns the final response
+pub fn streaming_prompt_with_sender<P, Input, S>(
+    model: P, 
+    sender: S
+) -> agent_ops::StreamingPromptWithSender<P, Input, S>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+    S: agent_ops::StreamingSender,
+{
+    agent_ops::streaming_prompt_with_sender(model, sender)
 }
 
 /// A stage in a streaming pipeline that can transform streaming responses

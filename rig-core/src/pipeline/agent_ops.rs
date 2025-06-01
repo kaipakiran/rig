@@ -1,19 +1,39 @@
 use std::future::IntoFuture;
 
 use crate::{
-    completion::{self, CompletionModel, CompletionError, CompletionRequest, CompletionRequestBuilder},
+    completion::{self, CompletionModel, CompletionError},
     extractor::{ExtractionError, Extractor},
     message::Message,
     vector_store,
     streaming::{StreamingCompletionModel, StreamingCompletionResponse, StreamingPrompt as StreamingPromptTrait},
+    agent::Agent,
 };
 
 use super::op::{Op, StreamingOp};
 use futures::{Stream, StreamExt, stream};
-use serde::de::DeserializeOwned;
-use std::future::Future;
 use std::pin::Pin;
 use futures::future::BoxFuture;
+
+/// Trait for sending streaming chunks
+pub trait StreamingSender: Send + Sync {
+    /// Send a chunk of text
+    fn send_chunk(&self, chunk: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    
+    /// Signal that streaming is complete (optional - default implementation does nothing)
+    fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
+/// Implementation for any closure that sends strings
+impl<F> StreamingSender for F 
+where
+    F: Fn(String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+{
+    fn send_chunk(&self, chunk: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self(chunk)
+    }
+}
 
 pub struct Lookup<I, In, T> {
     index: I,
@@ -211,6 +231,86 @@ where
     Input: Into<String> + Send + Sync,
 {
     Extract::new(extractor)
+}
+
+pub struct StreamingPromptWithSender<P, In, S> {
+    prompt: P,
+    sender: S,
+    _in: std::marker::PhantomData<In>,
+}
+
+impl<P, In, S> StreamingPromptWithSender<P, In, S>
+where
+    P: Send + Sync,
+    In: Send + Sync,
+    S: StreamingSender,
+{
+    pub fn new(prompt: P, sender: S) -> Self {
+        Self {
+            prompt,
+            sender,
+            _in: std::marker::PhantomData,
+        }
+    }
+}
+
+// Implementation for Agent types that implement StreamingPrompt
+impl<M, In, S> Op for StreamingPromptWithSender<Agent<M>, In, S>
+where
+    M: StreamingCompletionModel + Send + Sync,
+    M::StreamingResponse: Clone + Unpin + Send + Sync,
+    In: Into<String> + Send + Sync,
+    S: StreamingSender,
+{
+    type Input = In;
+    type Output = Result<String, CompletionError>;
+
+    async fn call(&self, input: Self::Input) -> Self::Output {
+        let message = Message::user(input.into());
+        let mut stream = self.prompt.stream_prompt(message).await?;
+        
+        let mut final_text = String::new();
+        
+        // Stream the chunks and send them via the sender
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(crate::message::AssistantContent::Text(text)) => {
+                    // Send the chunk via the sender (ignore send errors)
+                    let _ = self.sender.send_chunk(text.text.clone());
+                    // Accumulate for final response
+                    final_text.push_str(&text.text);
+                }
+                Ok(crate::message::AssistantContent::ToolCall(_)) => {
+                    // Handle tool calls if needed, for now just continue
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        // Signal that streaming is complete
+        let _ = self.sender.close();
+        
+        Ok(final_text)
+    }
+}
+
+/// Create a new streaming prompt operation that sends chunks via a generic sender and returns the final response.
+///
+/// The op will stream the response from the `model`, send each text chunk via the provided `sender`,
+/// and return the final aggregated response as a string.
+pub fn streaming_prompt_with_sender<P, In, S>(
+    model: P, 
+    sender: S
+) -> StreamingPromptWithSender<P, In, S>
+where
+    P: Send + Sync,
+    In: Send + Sync,
+    S: StreamingSender,
+{
+    StreamingPromptWithSender::new(model, sender)
 }
 
 #[cfg(test)]

@@ -162,7 +162,60 @@ tokio::spawn(async move {
 let result = pipeline.call("Rust programming").await?;
 ```
 
-### Pattern 2: Inline Agent Building
+### Pattern 2: External Processing with Custom Structs (Recommended)
+
+**New Approach - Complete External Control**:
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+struct MyCustomData {
+    timestamp: u64,
+    content: String,
+    chunk_id: usize,
+    word_count: usize,
+    session_id: String,
+    // Your custom fields
+}
+
+let (tx, mut rx) = mpsc::unbounded_channel::<MyCustomData>();
+
+let pipeline = pipeline::new()
+    .map(|input: String| format!("Tell me about: {}", input))
+    .chain(streaming_prompt(agent)); // Returns raw stream
+
+// Handle your custom structured data
+tokio::spawn(async move {
+    while let Some(my_data) = rx.recv().await {
+        // Your custom processing logic
+        send_to_websocket(&my_data).await;
+        save_to_database(&my_data).await;
+    }
+});
+
+// Get the stream and process externally
+let stream_response = pipeline.call("Rust programming").await?;
+let mut stream = stream_response;
+
+while let Some(chunk_result) = stream.next().await {
+    match chunk_result {
+        Ok(AssistantContent::Text(text)) => {
+            // Create YOUR custom struct
+            let my_data = MyCustomData {
+                timestamp: now(),
+                content: text.text,
+                chunk_id: chunk_counter,
+                word_count: text.text.split_whitespace().count(),
+                session_id: session_id.clone(),
+            };
+            
+            // Direct send of YOUR struct
+            tx.send(my_data)?;
+        }
+        // Handle other content types...
+    }
+}
+```
+
+### Pattern 3: Inline Agent Building
 
 ```rust
 let pipeline = pipeline::new()
@@ -175,7 +228,7 @@ let pipeline = pipeline::new()
     ));
 ```
 
-### Pattern 3: Custom Sender Implementation
+### Pattern 4: Custom Sender Implementation
 
 ```rust
 struct LoggingSender {

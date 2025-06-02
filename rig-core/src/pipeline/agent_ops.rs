@@ -256,6 +256,45 @@ where
     StreamingPromptWithSender::new(model, sender)
 }
 
+/// Streaming prompt operation that returns the stream directly for external processing
+pub struct StreamingPrompt<P, In> {
+    prompt: P,
+    _in: std::marker::PhantomData<In>,
+}
+
+impl<P, In> StreamingPrompt<P, In> {
+    pub fn new(prompt: P) -> Self {
+        Self {
+            prompt,
+            _in: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<M, In> Op for StreamingPrompt<Agent<M>, In>
+where
+    M: StreamingCompletionModel + Send + Sync,
+    M::StreamingResponse: Clone + Unpin + Send + Sync,
+    In: Into<String> + Send + Sync,
+{
+    type Input = In;
+    type Output = Result<crate::streaming::StreamingCompletionResponse<M::StreamingResponse>, CompletionError>;
+
+    async fn call(&self, input: Self::Input) -> Self::Output {
+        let message = Message::user(input.into());
+        self.prompt.stream_prompt(message).await
+    }
+}
+
+/// Create a new streaming prompt operation that returns the stream for external processing
+pub fn streaming_prompt<P, In>(model: P) -> StreamingPrompt<P, In>
+where
+    P: Send + Sync,
+    In: Send + Sync,
+{
+    StreamingPrompt::new(model)
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

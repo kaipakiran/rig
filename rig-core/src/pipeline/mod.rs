@@ -409,6 +409,17 @@ where
     agent_ops::streaming_prompt_with_sender(model, sender)
 }
 
+/// Create a new streaming prompt operation that returns the stream for external processing
+pub fn streaming_prompt<P, Input>(
+    model: P
+) -> agent_ops::StreamingPrompt<P, Input>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+{
+    agent_ops::streaming_prompt(model)
+}
+
 /// A stage in a streaming pipeline that can transform streaming responses
 pub struct StreamingPipelineStage<P, R> {
     prompt: P,

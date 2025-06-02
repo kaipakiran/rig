@@ -14,126 +14,80 @@
 
 This guide explains the streaming support implementation in rig-core pipelines. The implementation allows you to:
 
-1. **Get real-time streaming chunks** from LLM responses via channels (like `tokio::sync::mpsc`)
-2. **Still receive the final aggregated response** through the regular `Op` interface
-3. **Seamlessly integrate** with existing pipeline patterns
-4. **Use any sender mechanism** through a generic `StreamingSender` trait
+1. **Get raw streaming responses** from LLM models via the `streaming_prompt()` function
+2. **Process chunks externally** with your own custom logic and data structures
+3. **Send structured data** using direct `tx.send(MyCustomStruct)` calls
+4. **Seamlessly integrate** with existing pipeline patterns
 
 ### Key Benefits
-- ✅ Real-time streaming without changing existing pipeline architecture
-- ✅ Generic sender interface (works with tokio channels, custom senders, etc.)
-- ✅ Maintains compatibility with existing `Op` trait
-- ✅ Clean separation of streaming and final response handling
+- ✅ Real-time streaming with complete external control
+- ✅ Direct `tx.send(MyCustomStruct)` usage - no abstractions
+- ✅ Maintains compatibility with existing `Op` trait  
+- ✅ Clean separation: rig handles streaming, you handle processing
 
 ## Architecture
 
-The streaming implementation uses a **"dual output" approach**:
+The streaming implementation uses an **"external processing" approach**:
 
 ```text
-Input String → StreamingPromptWithSender → 
-                     ↓                ↓
-              Streaming Chunks    Final String
-              (via Sender)        (via Op return)
+Input String → streaming_prompt(agent) → Raw Stream
+                                           ↓
+                              Your Processing Logic
+                                           ↓
+                              tx.send(MyCustomStruct)
 ```
 
 ### Core Design Principles
 
 1. **Non-invasive**: Doesn't change existing `Op` trait or pipeline behavior
-2. **Generic**: Works with any sender that implements `StreamingSender`
+2. **External control**: You handle all processing and sending logic outside of rig
 3. **Composable**: Integrates seamlessly with existing pipeline combinators
 4. **Type-safe**: Full Rust type safety with appropriate trait bounds
 
 ## Core Components
 
-### 1. StreamingSender Trait
+### 1. StreamingPrompt Struct
 
 ```rust
-pub trait StreamingSender: Send + Sync {
-    /// Send a chunk of text
-    fn send_chunk(&self, chunk: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    
-    /// Signal that streaming is complete (optional)
-    fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-}
-```
-
-**Purpose**: Abstraction over different sending mechanisms
-**Key Features**:
-- Generic over any sender type
-- Error handling for send failures
-- Optional close notification
-
-### 2. StreamingPromptWithSender Struct
-
-```rust
-pub struct StreamingPromptWithSender<P, In, S> {
-    prompt: P,    // The agent/model to prompt
-    sender: S,    // The streaming sender
+pub struct StreamingPrompt<P, In> {
+    prompt: P,
     _in: std::marker::PhantomData<In>,
 }
 ```
 
-**Purpose**: Main operation that handles both streaming and final response
+**Purpose**: Operation that returns raw streaming response for external processing
 **Type Parameters**:
 - `P`: The promptable agent/model
 - `In`: Input type (must convert to String)
-- `S`: The sender type (must implement StreamingSender)
 
-### 3. Op Implementation
+### 2. Op Implementation
 
 ```rust
-impl<M, In, S> Op for StreamingPromptWithSender<Agent<M>, In, S>
+impl<M, In> Op for StreamingPrompt<Agent<M>, In>
 where
     M: StreamingCompletionModel + Send + Sync,
     M::StreamingResponse: Clone + Unpin + Send + Sync,
     In: Into<String> + Send + Sync,
-    S: StreamingSender,
 {
     type Input = In;
-    type Output = Result<String, CompletionError>;
+    type Output = Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError>;
 
     async fn call(&self, input: Self::Input) -> Self::Output {
-        // Convert input to message
         let message = Message::user(input.into());
-        
-        // Start streaming
-        let mut stream = self.prompt.stream_prompt(message).await?;
-        
-        let mut final_text = String::new();
-        
-        // Process each chunk
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(AssistantContent::Text(text)) => {
-                    // Send chunk via sender (ignore errors)
-                    let _ = self.sender.send_chunk(text.text.clone());
-                    // Accumulate for final response
-                    final_text.push_str(&text.text);
-                }
-                Ok(AssistantContent::ToolCall(_)) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        
-        // Close streaming
-        let _ = self.sender.close();
-        
-        Ok(final_text)
+        self.prompt.stream_prompt(message).await
     }
 }
 ```
 
 **Key Behaviors**:
-- Streams each chunk via the sender
-- Accumulates all chunks into final response
-- Handles errors gracefully
-- Ignores sender errors (non-blocking)
+- Converts input to user message
+- Calls the agent's streaming method
+- Returns raw stream for external processing
+- No internal processing or sending - that's your responsibility
 
 ## Usage Patterns
 
-### Pattern 1: Traditional Pipeline → Streaming Pipeline
+### Pattern 1: Traditional Pipeline → External Streaming
 
 **Before (Traditional)**:
 ```rust
@@ -144,36 +98,14 @@ let pipeline = pipeline::new()
 let result = pipeline.call("Rust programming").await?;
 ```
 
-**After (Streaming)**:
-```rust
-let (tx, mut rx) = mpsc::unbounded_channel();
-
-let pipeline = pipeline::new()
-    .map(|input: String| format!("Tell me about: {}", input))
-    .chain(streaming_prompt_with_sender(agent, tx));
-
-// Handle streaming chunks
-tokio::spawn(async move {
-    while let Some(chunk) = rx.recv().await {
-        print!("{}", chunk);
-    }
-});
-
-let result = pipeline.call("Rust programming").await?;
-```
-
-### Pattern 2: External Processing with Custom Structs (Recommended)
-
-**New Approach - Complete External Control**:
+**After (External Streaming)**:
 ```rust
 #[derive(Debug, Serialize, Deserialize)]
 struct MyCustomData {
     timestamp: u64,
     content: String,
     chunk_id: usize,
-    word_count: usize,
-    session_id: String,
-    // Your custom fields
+    // Your custom fields...
 }
 
 let (tx, mut rx) = mpsc::unbounded_channel::<MyCustomData>();
@@ -203,43 +135,13 @@ while let Some(chunk_result) = stream.next().await {
                 timestamp: now(),
                 content: text.text,
                 chunk_id: chunk_counter,
-                word_count: text.text.split_whitespace().count(),
-                session_id: session_id.clone(),
+                // ... your custom fields
             };
             
             // Direct send of YOUR struct
             tx.send(my_data)?;
         }
         // Handle other content types...
-    }
-}
-```
-
-### Pattern 3: Inline Agent Building
-
-```rust
-let pipeline = pipeline::new()
-    .map(|input: String| format!("Write a story about: {}", input))
-    .chain(streaming_prompt_with_sender(
-        client.agent(GEMINI_1_5_FLASH)
-            .preamble("You are a creative writer")
-            .build(),
-        tx
-    ));
-```
-
-### Pattern 4: Custom Sender Implementation
-
-```rust
-struct LoggingSender {
-    file: Arc<Mutex<File>>,
-}
-
-impl StreamingSender for LoggingSender {
-    fn send_chunk(&self, chunk: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", chunk)?;
-        Ok(())
     }
 }
 ```
@@ -266,17 +168,279 @@ M::StreamingResponse: Clone + Unpin + Send + Sync,
 - `Clone + Unpin`: Required for stream processing
 - `M::StreamingResponse`: Associated type for streaming responses
 
-### Error Handling Strategy
+### External Processing Strategy
 
 ```rust
-// Send chunk via sender (ignore errors)
-let _ = self.sender.send_chunk(text.text.clone());
+// You get the raw stream and process it yourself
+let stream_response = pipeline.call(input).await?;
+let mut stream = stream_response;
+
+while let Some(chunk_result) = stream.next().await {
+    match chunk_result {
+        Ok(AssistantContent::Text(text)) => {
+            // YOUR custom processing logic here
+            let my_data = MyCustomStruct {
+                content: text.text,
+                // ... your fields
+            };
+            tx.send(my_data)?;
+        }
+    }
+}
 ```
 
-**Why ignore sender errors?**
-- Streaming is "best effort" - don't fail the entire operation if sender fails
-- Final response is still returned even if streaming fails
-- User can handle sender errors in their sender implementation
+**Why external processing?**
+- Complete control over data structure and processing logic
+- No abstraction overhead - direct `tx.send(MyCustomStruct)`
+- Flexibility to handle chunks however you want
+- Clean separation of concerns between rig and your application
+
+## Detailed Implementation Changes
+
+### Changes to `agent_ops.rs` - For Novice Rust Developers
+
+This section explains exactly what code was added to enable external streaming processing, with detailed explanations of Rust concepts.
+
+#### 1. New StreamingPrompt Struct
+
+**What was added:**
+```rust
+/// Streaming prompt operation that returns the stream directly for external processing
+pub struct StreamingPrompt<P, In> {
+    prompt: P,
+    _in: std::marker::PhantomData<In>,
+}
+```
+
+**Rust concepts explained:**
+
+**Generic Types (`<P, In>`):**
+- `P` represents the type of the prompt/agent (like `Agent<GeminiModel>`)
+- `In` represents the input type (like `String` or `&str`)
+- Generics let the same struct work with different types while maintaining type safety
+
+**PhantomData:**
+```rust
+_in: std::marker::PhantomData<In>,
+```
+- **What it is**: A zero-sized type that "marks" the struct as using type `In`
+- **Why needed**: The struct needs to be generic over `In` for type safety, but doesn't actually store an `In` value
+- **Runtime cost**: Zero - it completely disappears when compiled
+- **Alternative**: Without PhantomData, Rust would complain about "unused type parameter"
+
+**Example analogy**: It's like putting a label on a box saying "this box is for apples" even though the box is currently empty.
+
+#### 2. Constructor Implementation
+
+**What was added:**
+```rust
+impl<P, In> StreamingPrompt<P, In> {
+    pub fn new(prompt: P) -> Self {
+        Self {
+            prompt,
+            _in: std::marker::PhantomData,
+        }
+    }
+}
+```
+
+**Rust concepts explained:**
+
+**impl blocks:**
+- `impl<P, In>` means "for any types P and In"
+- This provides methods for the `StreamingPrompt` struct
+- `Self` is a shorthand for `StreamingPrompt<P, In>`
+
+**Constructor pattern:**
+- `new()` is a Rust convention for constructors (not a language keyword)
+- Takes ownership of `prompt` and moves it into the struct
+- `std::marker::PhantomData` creates the zero-sized marker
+
+#### 3. The Core Op Implementation
+
+**What was added:**
+```rust
+impl<M, In> Op for StreamingPrompt<Agent<M>, In>
+where
+    M: StreamingCompletionModel + Send + Sync,
+    M::StreamingResponse: Clone + Unpin + Send + Sync,
+    In: Into<String> + Send + Sync,
+{
+    type Input = In;
+    type Output = Result<crate::streaming::StreamingCompletionResponse<M::StreamingResponse>, CompletionError>;
+
+    async fn call(&self, input: Self::Input) -> Self::Output {
+        let message = Message::user(input.into());
+        self.prompt.stream_prompt(message).await
+    }
+}
+```
+
+**Breaking this down for novice developers:**
+
+**Trait Implementation:**
+```rust
+impl<M, In> Op for StreamingPrompt<Agent<M>, In>
+```
+- This says: "StreamingPrompt containing an Agent implements the Op trait"
+- `Op` is rig's core interface for pipeline operations
+- Only works with `Agent<M>` because only agents can stream in rig
+
+**Where Clause (Constraints):**
+```rust
+where
+    M: StreamingCompletionModel + Send + Sync,
+    M::StreamingResponse: Clone + Unpin + Send + Sync,
+    In: Into<String> + Send + Sync,
+```
+
+**Each constraint explained:**
+
+1. **`M: StreamingCompletionModel`**
+   - The model type `M` must implement streaming
+   - Ensures we can call `.stream_prompt()` on it
+   - **Real example**: `GeminiModel` implements this, but a non-streaming model wouldn't
+
+2. **`M: Send + Sync`**
+   - `Send`: Type can be moved between threads
+   - `Sync`: Type can be shared between threads safely
+   - **Why needed**: Async operations might run on different threads
+
+3. **`M::StreamingResponse: Clone + Unpin + Send + Sync`**
+   - `M::StreamingResponse`: The response type from streaming (associated type)
+   - `Clone`: Must be cloneable (for stream processing)
+   - `Unpin`: Can be moved in memory (required for async streams)
+   - `Send + Sync`: Thread safety for async operations
+
+4. **`In: Into<String> + Send + Sync`**
+   - `Into<String>`: Input can be converted to String
+   - **Examples**: `String`, `&str`, `Cow<str>` all implement `Into<String>`
+   - **Flexibility**: Users can pass different string types
+
+**Associated Types:**
+```rust
+type Input = In;
+type Output = Result<crate::streaming::StreamingCompletionResponse<M::StreamingResponse>, CompletionError>;
+```
+
+- **`Input = In`**: Simple - input type is whatever `In` is
+- **`Output = Result<...>`**: Returns either a streaming response or an error
+  - **Success**: `StreamingCompletionResponse` (implements `Stream`)
+  - **Error**: `CompletionError` if streaming fails to start
+
+**The Core Logic:**
+```rust
+async fn call(&self, input: Self::Input) -> Self::Output {
+    let message = Message::user(input.into());
+    self.prompt.stream_prompt(message).await
+}
+```
+
+**Step-by-step execution:**
+
+1. **`input: Self::Input`** - Receive input (String, &str, etc.)
+2. **`input.into()`** - Convert to String using `Into` trait
+3. **`Message::user(...)`** - Wrap string as a user message in rig's format
+4. **`self.prompt.stream_prompt(message)`** - Call agent's streaming method
+5. **`.await`** - Wait for async operation (streaming setup)
+6. **Return** - Either streaming response or error
+
+#### 4. Factory Function
+
+**What was added:**
+```rust
+/// Create a new streaming prompt operation that returns the stream for external processing
+pub fn streaming_prompt<P, Input>(
+    model: P
+) -> agent_ops::StreamingPrompt<P, Input>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+{
+    agent_ops::streaming_prompt(model)
+}
+```
+
+**Why a factory function:**
+- **Convenience**: Easier to call than `StreamingPrompt::new()`
+- **Type inference**: Rust can often infer the generic types
+- **API consistency**: Matches other rig functions like `prompt()`, `map()`, etc.
+
+### Changes to `mod.rs` - Module Integration
+
+**What was added:**
+```rust
+/// Create a new streaming prompt operation that returns the stream for external processing
+pub fn streaming_prompt<P, Input>(
+    model: P
+) -> agent_ops::StreamingPrompt<P, Input>
+where
+    P: Send + Sync,
+    Input: Send + Sync,
+{
+    agent_ops::streaming_prompt(model)
+}
+```
+
+**Why this is needed:**
+- **Public API**: Makes the function available outside the module
+- **Re-export**: Users can call `pipeline::streaming_prompt()` instead of `agent_ops::streaming_prompt()`
+- **API consistency**: Follows same pattern as other pipeline functions
+
+### No Changes to `op.rs`
+
+**Important note**: The core `Op` trait in `op.rs` was **not modified**. This is a key design principle:
+
+**Why no changes to Op:**
+- **Backward compatibility**: All existing code continues to work
+- **Non-invasive design**: New functionality doesn't break existing patterns
+- **Extensibility**: The `Op` trait is flexible enough to support new implementations
+
+**How it works without changes:**
+- Our new `StreamingPrompt` struct implements the existing `Op` trait
+- The trait's design allows for different input/output types via generics
+- No modification needed because `Op` was already designed to be extensible
+
+### Memory and Performance Characteristics
+
+**For novice developers - what actually happens at runtime:**
+
+1. **Zero-cost abstractions:**
+   - `PhantomData`: Completely disappears at compile time
+   - Generic types: Compile to specific types (monomorphization)
+   - **Result**: No runtime overhead from our abstractions
+
+2. **Stream processing:**
+   - **Lazy evaluation**: Chunks only generated when you request them
+   - **Backpressure**: If you stop reading, generation pauses
+   - **Memory efficient**: Only one chunk in memory at a time
+
+3. **Error handling:**
+   - **Fail-fast**: If streaming setup fails, you get an immediate error
+   - **Graceful degradation**: Individual chunk errors don't stop the stream
+
+### Design Philosophy: Why This Approach?
+
+**For novice developers - the "why" behind the design:**
+
+1. **Separation of concerns:**
+   - **Rig handles**: Stream generation and low-level streaming protocols
+   - **Your code handles**: Data structuring, sending, processing logic
+
+2. **Type safety:**
+   - **Compile-time guarantees**: Can't accidentally use non-streaming models
+   - **Generic flexibility**: Works with any string-like input, any streaming model
+
+3. **Async-first design:**
+   - **Non-blocking**: Streaming doesn't block other operations
+   - **Concurrent**: Can process multiple streams simultaneously
+
+4. **Rust idioms:**
+   - **Zero-cost abstractions**: Performance with safety
+   - **Ownership model**: Clear ownership of data and streams
+   - **Error handling**: Explicit error types, no hidden failures
+
+This implementation showcases many core Rust concepts: generics, traits, async programming, error handling, and zero-cost abstractions - all working together to provide a safe, fast, and flexible streaming interface!
 
 ## Rust Concepts Explained
 
